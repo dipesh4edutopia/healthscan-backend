@@ -1,0 +1,13 @@
+# Backend dependencies for Flask + Supabase PostgreSQL + Google Auth
+Flask==3.0.3
+Flask-Cors==4.0.1
+python-dotenv==1.0.1
+PyJWT==2.8.0
+cryptography==42.0.5
+google-auth==2.29.0
+requests==2.31.0
+psycopg2-binary==2.9.9
+
+# Testing
+pytest==8.1.1
+pytest-mock==3.14.0
