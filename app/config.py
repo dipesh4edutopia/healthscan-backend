@@ -4,6 +4,8 @@ Loads configuration from environment variables with safe defaults.
 """
 
 import os
+import json
+import logging
 from datetime import timedelta
 from dotenv import load_dotenv
 
@@ -12,6 +14,19 @@ backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 dotenv_path = os.path.join(backend_root, '.env')
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
+
+
+def _json_env(name: str, default):
+    """Parse a JSON object from an environment variable, falling back to default."""
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return default
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else default
+    except json.JSONDecodeError:
+        logging.getLogger(__name__).warning("Environment variable %s is not valid JSON; ignoring.", name)
+        return default
 
 
 class Config:
@@ -60,6 +75,35 @@ class Config:
         if origin.strip()
     ]
 
+    # ------------------------------------------------------------------
+    # Payments: Google Play Billing
+    # ------------------------------------------------------------------
+    # JSON map of app_key -> Android package name, e.g.
+    #   {"main_app": "com.healthscanapp.mobile", "learnboard_app": "com.learnboard"}
+    GOOGLE_PLAY_PACKAGES = _json_env('GOOGLE_PLAY_PACKAGES', {})
+    # Service account credentials with access to the Play Console (Android Publisher API).
+    # Provide EITHER the raw JSON content (recommended on Render) OR a file path.
+    GOOGLE_PLAY_SERVICE_ACCOUNT_JSON = os.getenv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON', '').strip()
+    GOOGLE_PLAY_SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_PLAY_SERVICE_ACCOUNT_FILE', '').strip()
+
+    # ------------------------------------------------------------------
+    # Payments: Apple In-App Purchase (App Store Server API)
+    # ------------------------------------------------------------------
+    # JSON map of app_key -> iOS bundle id, e.g. {"main_app": "com.healthscanapp.mobile"}
+    APPLE_BUNDLE_IDS = _json_env('APPLE_BUNDLE_IDS', {})
+    APPLE_IAP_KEY_ID = os.getenv('APPLE_IAP_KEY_ID', '').strip()
+    APPLE_IAP_ISSUER_ID = os.getenv('APPLE_IAP_ISSUER_ID', '').strip()
+    # Contents of the .p8 private key. Literal "\n" sequences are converted to newlines.
+    APPLE_IAP_PRIVATE_KEY = os.getenv('APPLE_IAP_PRIVATE_KEY', '').replace('\\n', '\n').strip()
+
+    # How often (minutes) an expired-looking subscription may be re-checked with the store
+    # when the user asks for their status. Covers renewals until webhooks are added.
+    PAYMENTS_REVERIFY_INTERVAL_MINUTES = int(os.getenv('PAYMENTS_REVERIFY_INTERVAL_MINUTES', 60))
+
+    # Optional shared secrets for verifying incoming store webhook calls
+    GOOGLE_RTDN_WEBHOOK_SECRET = os.getenv('GOOGLE_RTDN_WEBHOOK_SECRET', '').strip()
+    APPLE_WEBHOOK_SECRET = os.getenv('APPLE_WEBHOOK_SECRET', '').strip()
+
 
 class TestConfig(Config):
     """Testing Configuration"""
@@ -69,3 +113,5 @@ class TestConfig(Config):
     JWT_SECRET_KEY = 'test-jwt-secret-key'
     GOOGLE_CLIENT_IDS = ['test-web-client-id.apps.googleusercontent.com']
     DATABASE_URL = 'mock://testing'
+    GOOGLE_PLAY_PACKAGES = {'main_app': 'com.healthscanapp.mobile'}
+    APPLE_BUNDLE_IDS = {}

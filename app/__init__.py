@@ -10,6 +10,7 @@ from flask_cors import CORS
 
 from app.config import Config
 from app.routes.auth_routes import auth_bp
+from app.routes.payment_routes import payment_bp
 from app.database import init_db_pool, close_db_pool, get_db_cursor
 
 # Configure structured logging
@@ -36,8 +37,9 @@ def create_app(config_class=Config) -> Flask:
         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     )
 
-    # Register authentication blueprint
+    # Register authentication & payments blueprints
     app.register_blueprint(auth_bp)
+    app.register_blueprint(payment_bp)
 
     # Public liveness & DB connectivity health check
     @app.route('/api/v1/health', methods=['GET'])

@@ -4,7 +4,7 @@ Provides decorators to protect Flask endpoints using backend-issued JWTs.
 """
 
 from functools import wraps
-from typing import Sequence
+from typing import Optional, Sequence
 from flask import request, jsonify, g
 
 from app.services.token_service import (
@@ -12,6 +12,7 @@ from app.services.token_service import (
     TokenExpiredError,
     InvalidAccessTokenError,
 )
+from app.services.payment_service import PaymentService
 
 
 def require_auth(f):
@@ -139,6 +140,56 @@ def require_app(*allowed_app_keys: str):
                     'message': f"This endpoint is not available for application '{current_app_key}'.",
                 }), 403
 
+            return f(*args, **kwargs)
+
+        return decorated_function
+
+    return decorator
+
+
+def require_subscription(required_feature: Optional[str] = None):
+    """
+    Decorator to enforce an active Pro subscription on the current app.
+    Must be placed AFTER @require_auth.
+
+    Optionally checks if a specific feature key is enabled in the user's plan features.
+
+    Example:
+      @vitals_bp.route('/ai-deep-analysis', methods=['POST'])
+      @require_auth
+      @require_subscription('premium')
+      def ai_deep_analysis():
+          ...
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user_id = getattr(g, 'current_user_id', None)
+            app_id = getattr(g, 'current_app_id', None)
+            if not user_id or not app_id:
+                return jsonify({
+                    'error': 'Unauthorized',
+                    'message': 'Authentication context not established. Ensure @require_auth is applied.',
+                }), 401
+
+            sub_status = PaymentService.get_user_subscription_status(user_id, app_id)
+            if not sub_status.get('is_pro'):
+                return jsonify({
+                    'error': 'SubscriptionRequired',
+                    'message': 'This feature requires an active Pro subscription.',
+                    'upgrade_url': '/api/v1/payments/plans',
+                }), 403
+
+            if required_feature:
+                features = sub_status.get('features') or {}
+                if not features.get(required_feature):
+                    return jsonify({
+                        'error': 'UpgradeRequired',
+                        'message': f"Your current plan does not include '{required_feature}'.",
+                        'upgrade_url': '/api/v1/payments/plans',
+                    }), 403
+
+            g.current_subscription = sub_status
             return f(*args, **kwargs)
 
         return decorated_function

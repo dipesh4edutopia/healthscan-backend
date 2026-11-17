@@ -290,6 +290,176 @@ class MockCursor:
                 self.last_result = []
             return
 
+        # -------------------------------------------------------------
+        # 13. SELECT FROM public.subscription_plans
+        # -------------------------------------------------------------
+        if "FROM public.subscription_plans" in normalized:
+            if "WHERE app_id = %s AND is_active = TRUE AND" in normalized:
+                aid, prod_id, plan_key = str(params[0]), params[1], params[2]
+                matched = [
+                    dict(p) for p in self.db.subscription_plans.values()
+                    if p['app_id'] == aid
+                    and p['is_active']
+                    and (
+                        p.get('google_product_id') == prod_id
+                        or p.get('apple_product_id') == prod_id
+                        or p.get('plan_key') == plan_key
+                    )
+                ]
+                self.last_result = matched[:1]
+                return
+            elif "WHERE app_id = %s AND is_active = TRUE" in normalized:
+                aid = str(params[0])
+                matched = sorted(
+                    [
+                        dict(p) for p in self.db.subscription_plans.values()
+                        if p['app_id'] == aid and p['is_active']
+                    ],
+                    key=lambda p: p['price'],
+                )
+                self.last_result = matched
+                return
+
+        # -------------------------------------------------------------
+        # 14. INSERT / UPSERT INTO public.user_subscriptions
+        # -------------------------------------------------------------
+        if "INSERT INTO public.user_subscriptions" in normalized:
+            import json as _json
+            uid, aid, pid, provider, provider_sub_id, status, starts_at, expires_at, auto_renew, canceled_at, raw_json = params
+            key = (str(uid), str(aid))
+            now = datetime.now(timezone.utc)
+            existing = self.db.user_subscriptions.get(key)
+            sub_id = existing['id'] if existing else str(uuid.uuid4())
+            record = {
+                'id': sub_id,
+                'user_id': str(uid),
+                'app_id': str(aid),
+                'plan_id': str(pid),
+                'provider': provider,
+                'provider_subscription_id': provider_sub_id,
+                'status': status,
+                'starts_at': starts_at,
+                'expires_at': expires_at,
+                'auto_renew': auto_renew,
+                'canceled_at': canceled_at,
+                'last_verified_at': now,
+                'raw_receipt_data': _json.loads(raw_json) if isinstance(raw_json, str) else raw_json,
+                'created_at': existing['created_at'] if existing else now,
+                'updated_at': now,
+            }
+            self.db.user_subscriptions[key] = record
+            self.last_result = [{
+                'id': sub_id,
+                'status': status,
+                'starts_at': starts_at,
+                'expires_at': expires_at,
+                'auto_renew': auto_renew,
+            }]
+            return
+
+        # -------------------------------------------------------------
+        # 15. INSERT INTO public.payment_transactions
+        # -------------------------------------------------------------
+        if "INSERT INTO public.payment_transactions" in normalized:
+            import json as _json
+            if len(params) == 10:
+                uid, aid, sid, pid, provider, tx_id, amount, currency, tx_status, raw_json = params
+            else:
+                uid, aid, sid, pid, provider, tx_id, amount, currency, raw_json = params
+                tx_status = 'success'
+            tx_key = (provider, tx_id)
+            if tx_key in self.db.payment_transactions:
+                self.last_result = []
+                return
+            record_id = str(uuid.uuid4())
+            self.db.payment_transactions[tx_key] = {
+                'id': record_id,
+                'user_id': str(uid),
+                'app_id': str(aid),
+                'subscription_id': str(sid),
+                'plan_id': str(pid),
+                'provider': provider,
+                'provider_transaction_id': tx_id,
+                'amount': amount,
+                'currency': currency,
+                'status': tx_status,
+                'raw_response': _json.loads(raw_json) if isinstance(raw_json, str) else raw_json,
+                'created_at': datetime.now(timezone.utc),
+            }
+            self.last_result = [{'id': record_id}]
+            return
+
+        # -------------------------------------------------------------
+        # 16. SELECT FROM public.user_subscriptions (status or webhook lookup)
+        # -------------------------------------------------------------
+        if "FROM public.user_subscriptions us" in normalized:
+            if "WHERE us.provider = %s AND us.provider_subscription_id = %s" in normalized:
+                provider, provider_sub_id = params[0], params[1]
+                matched = None
+                for sub in self.db.user_subscriptions.values():
+                    if sub['provider'] == provider and sub.get('provider_subscription_id') == provider_sub_id:
+                        matched = sub
+                        break
+                if not matched:
+                    self.last_result = []
+                    return
+                plan = self.db.subscription_plans.get(matched['plan_id'], {})
+                app_rec = self.db.apps.get(matched['app_id'], {})
+                self.last_result = [{
+                    'id': matched['id'],
+                    'user_id': matched['user_id'],
+                    'app_id': matched['app_id'],
+                    'plan_id': matched['plan_id'],
+                    'status': matched['status'],
+                    'expires_at': matched['expires_at'],
+                    'auto_renew': matched['auto_renew'],
+                    'billing_period': plan.get('billing_period'),
+                    'price': plan.get('price', 0),
+                    'currency': plan.get('currency', 'INR'),
+                    'app_key': app_rec.get('app_key'),
+                }]
+                return
+
+            uid, aid = str(params[0]), str(params[1])
+            sub = self.db.user_subscriptions.get((uid, aid))
+            if not sub:
+                self.last_result = []
+                return
+            plan = self.db.subscription_plans.get(sub['plan_id'], {})
+            self.last_result = [{
+                'id': sub['id'],
+                'status': sub['status'],
+                'provider': sub['provider'],
+                'starts_at': sub['starts_at'],
+                'expires_at': sub['expires_at'],
+                'auto_renew': sub['auto_renew'],
+                'last_verified_at': sub['last_verified_at'],
+                'plan_key': plan.get('plan_key'),
+                'plan_name': plan.get('name'),
+                'billing_period': plan.get('billing_period'),
+                'features': plan.get('features') or {},
+            }]
+            return
+
+        # -------------------------------------------------------------
+        # 17. UPDATE public.user_subscriptions (webhook update)
+        # -------------------------------------------------------------
+        if "UPDATE public.user_subscriptions" in normalized:
+            import json as _json
+            status, expires_at, auto_renew, canceled_at, raw_json, sid = params
+            for sub in self.db.user_subscriptions.values():
+                if sub['id'] == str(sid):
+                    sub['status'] = status
+                    sub['expires_at'] = expires_at
+                    sub['auto_renew'] = auto_renew
+                    if canceled_at is not None:
+                        sub['canceled_at'] = canceled_at
+                    sub['last_verified_at'] = datetime.now(timezone.utc)
+                    sub['raw_receipt_data'] = _json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                    break
+            self.last_result = []
+            return
+
         # Fallback empty
         self.last_result = []
 
@@ -306,14 +476,17 @@ class MockCursor:
 
 
 class MockDatabase:
-    """Mock Database container holding dictionaries for the 4 schema tables."""
+    """Mock Database container holding dictionaries for auth and payment schema tables."""
     def __init__(self):
         self.users: Dict[str, Dict[str, Any]] = {}
         self.apps: Dict[str, Dict[str, Any]] = {}
         self.user_app_access: Dict[tuple, Dict[str, Any]] = {}
         self.refresh_tokens: Dict[str, Dict[str, Any]] = {}
+        self.subscription_plans: Dict[str, Dict[str, Any]] = {}
+        self.user_subscriptions: Dict[tuple, Dict[str, Any]] = {}
+        self.payment_transactions: Dict[tuple, Dict[str, Any]] = {}
 
-        # Pre-seed applications
+        # Pre-seed applications & plans
         self._seed_default_apps()
 
     def _seed_default_apps(self):
@@ -344,6 +517,41 @@ class MockDatabase:
             'created_at': datetime.now(timezone.utc),
         }
 
+        # Seed plans for main_app (₹150 yearly + ₹300 lifetime)
+        yearly_id = str(uuid.uuid4())
+        self.subscription_plans[yearly_id] = {
+            'id': yearly_id,
+            'app_id': main_app_id,
+            'plan_key': 'yearly_pro',
+            'name': 'HealthScan Pro Yearly',
+            'description': '1 year unlimited access',
+            'google_product_id': 'healthscan_pro_yearly',
+            'apple_product_id': 'healthscan_pro_yearly',
+            'price': 150.00,
+            'currency': 'INR',
+            'billing_period': 'yearly',
+            'trial_days': 0,
+            'features': {'premium': True},
+            'is_active': True,
+        }
+
+        lifetime_id = str(uuid.uuid4())
+        self.subscription_plans[lifetime_id] = {
+            'id': lifetime_id,
+            'app_id': main_app_id,
+            'plan_key': 'lifetime_pro',
+            'name': 'HealthScan Pro Lifetime',
+            'description': 'Lifetime access',
+            'google_product_id': 'healthscan_pro_lifetime',
+            'apple_product_id': 'healthscan_pro_lifetime',
+            'price': 300.00,
+            'currency': 'INR',
+            'billing_period': 'lifetime',
+            'trial_days': 0,
+            'features': {'premium': True},
+            'is_active': True,
+        }
+
     @contextmanager
     def get_cursor(self, commit: bool = False):
         yield MockCursor(self)
@@ -354,9 +562,9 @@ def app():
     """Create Flask test application."""
     test_app = create_app(TestConfig)
 
-    # Register test-only routes to verify reusable auth & RBAC middleware decorators
+    # Register test-only routes to verify reusable auth, RBAC, and subscription middleware decorators
     from flask import jsonify, g
-    from app.middleware import require_auth, require_role
+    from app.middleware import require_auth, require_role, require_subscription
 
     @test_app.route('/api/v1/test/protected', methods=['GET'])
     @require_auth
@@ -380,6 +588,21 @@ def app():
             'admin_user_id': g.current_user_id,
             'role': g.current_role,
         }), 200
+
+    @test_app.route('/api/v1/test/pro-feature', methods=['GET'])
+    @require_auth
+    @require_subscription('premium')
+    def _test_pro_feature():
+        return jsonify({
+            'message': 'Pro feature unlocked!',
+            'plan_key': g.current_subscription['plan_key'],
+        }), 200
+
+    @test_app.route('/api/v1/test/vip-only', methods=['GET'])
+    @require_auth
+    @require_subscription('vip_only_flag')
+    def _test_vip_only():
+        return jsonify({'message': 'VIP unlocked!'}), 200
 
     return test_app
 
