@@ -6,7 +6,7 @@ and checking active user entitlements.
 
 import hmac
 import logging
-from flask import Blueprint, request, jsonify, g
+from flask import Blueprint, request, jsonify, g, current_app
 
 from app.config import Config
 from app.middleware import require_auth
@@ -16,6 +16,7 @@ from app.services.payment_service import (
     PaymentServiceError,
     PlanNotFoundError,
     InvalidProviderError,
+    PurchaseAlreadyLinkedError,
 )
 from app.services.store_verifier import (
     StoreVerificationError,
@@ -109,6 +110,8 @@ def verify_purchase():
         return jsonify({'error': 'InvalidProvider', 'message': str(ipe)}), 400
     except PlanNotFoundError as pnfe:
         return jsonify({'error': 'PlanNotFound', 'message': str(pnfe)}), 404
+    except PurchaseAlreadyLinkedError as pale:
+        return jsonify({'error': 'PurchaseAlreadyLinked', 'message': str(pale)}), 409
     except InvalidReceiptError as ire:
         return jsonify({'error': 'InvalidReceipt', 'message': str(ire)}), 400
     except StoreConfigurationError as sce:
@@ -148,12 +151,25 @@ def get_subscription_status():
         }), 500
 
 
-def _verify_webhook_secret(expected_secret: str) -> bool:
-    """Validates optional ?token=... query param or X-Webhook-Token header."""
+def _check_webhook_auth(expected_secret: str, env_name: str):
+    """
+    Fail-closed webhook authentication.
+    - Secret not configured -> 503 (endpoint disabled) unless running under TESTING.
+    - Secret configured     -> must match ?token=... or X-Webhook-Token (constant-time compare).
+    Returns None when authorised, otherwise a Flask (response, status) tuple.
+    """
     if not expected_secret:
-        return True
+        if current_app.config.get('TESTING'):
+            return None
+        return jsonify({
+            'error': 'WebhookNotConfigured',
+            'message': f'Webhook is disabled until {env_name} is configured on the server.',
+        }), 503
+
     provided = request.args.get('token') or request.headers.get('X-Webhook-Token') or ''
-    return hmac.compare_digest(provided, expected_secret)
+    if not hmac.compare_digest(provided, expected_secret):
+        return jsonify({'error': 'Unauthorized', 'message': 'Invalid webhook token.'}), 401
+    return None
 
 
 @payment_bp.route('/webhook/google', methods=['POST'])
@@ -161,8 +177,9 @@ def google_rtdn_webhook():
     """
     Google Play Real-Time Developer Notifications (Cloud Pub/Sub Push endpoint).
     """
-    if not _verify_webhook_secret(Config.GOOGLE_RTDN_WEBHOOK_SECRET):
-        return jsonify({'error': 'Unauthorized', 'message': 'Invalid webhook token.'}), 401
+    denied = _check_webhook_auth(Config.GOOGLE_RTDN_WEBHOOK_SECRET, 'GOOGLE_RTDN_WEBHOOK_SECRET')
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True) or {}
     try:
@@ -180,8 +197,9 @@ def apple_server_webhook():
     """
     Apple App Store Server Notifications v2 endpoint.
     """
-    if not _verify_webhook_secret(Config.APPLE_WEBHOOK_SECRET):
-        return jsonify({'error': 'Unauthorized', 'message': 'Invalid webhook token.'}), 401
+    denied = _check_webhook_auth(Config.APPLE_WEBHOOK_SECRET, 'APPLE_WEBHOOK_SECRET')
+    if denied:
+        return denied
 
     payload = request.get_json(silent=True) or {}
     try:

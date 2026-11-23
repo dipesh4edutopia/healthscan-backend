@@ -5,6 +5,7 @@ Verifies purchases server-to-server with:
   - Apple App Store Server API v1 (Signed JWS transactions)
 """
 
+import base64
 import json
 import logging
 from datetime import datetime, timezone, timedelta
@@ -12,6 +13,9 @@ from typing import Dict, Any, Optional
 
 import jwt
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
@@ -23,6 +27,16 @@ logger = logging.getLogger(__name__)
 LIFETIME_EXPIRY = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 GOOGLE_ANDROID_PUBLISHER_SCOPE = "https://www.googleapis.com/auth/androidpublisher"
+
+# SHA-256 fingerprint (hex, lowercase) of "Apple Root CA - G3".
+# Every genuine App Store signed JWS (transactions + server notifications) carries an
+# x5c certificate chain that must end in this root.
+# Source: https://www.apple.com/certificateauthority/AppleRootCA-G3.cer
+APPLE_ROOT_CA_G3_SHA256 = "63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179"
+# Marker extensions Apple puts on the leaf ("Mac App Store Receipt Signing") and the
+# intermediate ("Worldwide Developer Relations") certificates.
+APPLE_LEAF_MARKER_OID = x509.ObjectIdentifier("1.2.840.113635.100.6.11.1")
+APPLE_INTERMEDIATE_MARKER_OID = x509.ObjectIdentifier("1.2.840.113635.100.6.2.1")
 
 
 class StoreVerificationError(Exception):
@@ -51,8 +65,84 @@ def _parse_iso_datetime(iso_str: str) -> datetime:
     return dt
 
 
+def _cert_validity(cert: x509.Certificate):
+    """(not_before, not_after) as aware UTC datetimes across cryptography versions."""
+    nb = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before.replace(tzinfo=timezone.utc)
+    na = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=timezone.utc)
+    return nb, na
+
+
+def decode_apple_jws(signed_jws: str) -> Dict[str, Any]:
+    """
+    Cryptographically verifies an Apple-signed JWS (signedTransactionInfo, signedPayload, ...)
+    and returns its payload.
+
+    Verification steps (same as Apple's official server library):
+      1. JWS header must contain an x5c chain (leaf, intermediate, root).
+      2. The chain root must match the pinned Apple Root CA - G3 SHA-256 fingerprint.
+      3. Every certificate must be within its validity period and be signed by the next one.
+      4. Leaf / intermediate must carry Apple's marker extensions.
+      5. The JWS signature (ES256) must verify with the leaf certificate's public key.
+
+    Raises InvalidReceiptError on any failure. Never returns unverified data.
+    """
+    if not signed_jws or not isinstance(signed_jws, str):
+        raise InvalidReceiptError("Apple signed payload is missing.")
+
+    try:
+        header = jwt.get_unverified_header(signed_jws)
+        if header.get("alg") != "ES256":
+            raise InvalidReceiptError("Apple JWS must use ES256.")
+        x5c = header.get("x5c") or []
+        if len(x5c) != 3:
+            raise InvalidReceiptError("Apple JWS certificate chain is missing or malformed.")
+
+        certs = [x509.load_der_x509_certificate(base64.b64decode(c)) for c in x5c]
+        leaf, intermediate, root = certs
+
+        if root.fingerprint(hashes.SHA256()).hex() != APPLE_ROOT_CA_G3_SHA256:
+            raise InvalidReceiptError("Apple JWS chain does not end in the trusted Apple Root CA.")
+
+        now = datetime.now(timezone.utc)
+        for cert in certs:
+            not_before, not_after = _cert_validity(cert)
+            if not (not_before <= now <= not_after):
+                raise InvalidReceiptError("Apple JWS certificate is expired or not yet valid.")
+
+        # Each cert must be signed by its issuer in the chain (root is self-signed).
+        for cert, issuer in ((leaf, intermediate), (intermediate, root), (root, root)):
+            issuer_key = issuer.public_key()
+            if not isinstance(issuer_key, ec.EllipticCurvePublicKey):
+                raise InvalidReceiptError("Unsupported Apple certificate key type.")
+            issuer_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                ec.ECDSA(cert.signature_hash_algorithm),
+            )
+
+        try:
+            leaf.extensions.get_extension_for_oid(APPLE_LEAF_MARKER_OID)
+            intermediate.extensions.get_extension_for_oid(APPLE_INTERMEDIATE_MARKER_OID)
+        except x509.ExtensionNotFound as exc:
+            raise InvalidReceiptError("Apple certificate chain is missing marker extensions.") from exc
+
+        return jwt.decode(
+            signed_jws,
+            leaf.public_key(),
+            algorithms=["ES256"],
+            options={"verify_aud": False},
+        )
+    except InvalidReceiptError:
+        raise
+    except Exception as exc:
+        logger.warning("Apple JWS verification failed: %s", exc)
+        raise InvalidReceiptError("Apple signed data failed signature verification.") from exc
+
+
 class StoreVerifier:
     """Unified server-side receipt verifier for Google Play and Apple App Store."""
+
+    decode_apple_jws = staticmethod(decode_apple_jws)
 
     @staticmethod
     def verify_purchase(
@@ -313,8 +403,8 @@ class StoreVerifier:
         if not signed_tx:
             raise InvalidReceiptError("Apple response missing signedTransactionInfo.")
 
-        # Decode JWS payload (Apple server response over TLS)
-        tx_info = jwt.decode(signed_tx, options={"verify_signature": False})
+        # Verify the Apple signature chain and decode the transaction payload
+        tx_info = StoreVerifier.decode_apple_jws(signed_tx)
 
         if tx_info.get("bundleId") != bundle_id:
             raise InvalidReceiptError("Apple transaction bundleId mismatch.")

@@ -452,6 +452,13 @@ class TestStoreWebhooks:
     def test_apple_webhook_renewal_and_refund(self, client, monkeypatch, mock_db):
         import jwt as pyjwt
 
+        # Signature verification is covered separately in TestAppleJwsVerification;
+        # here we only exercise the notification business logic with unsigned test JWTs.
+        monkeypatch.setattr(
+            "app.services.payment_service.StoreVerifier.decode_apple_jws",
+            lambda s: pyjwt.decode(s, options={"verify_signature": False}),
+        )
+
         auth = _login_user(client, monkeypatch)
         initial_expiry = datetime.now(timezone.utc) + timedelta(days=30)
         renewed_ms = int((datetime.now(timezone.utc) + timedelta(days=395)).timestamp() * 1000)
@@ -522,3 +529,281 @@ class TestStoreWebhooks:
             headers={"Authorization": f"Bearer {auth['access_token']}"},
         ).get_json()
         assert status_resp["is_pro"] is False
+
+
+class TestPurchaseOwnership:
+    def _verified(self, token):
+        return {
+            "provider_subscription_id": token,
+            "provider_transaction_id": f"GPA.{token}",
+            "status": "active",
+            "starts_at": datetime.now(timezone.utc),
+            "expires_at": LIFETIME_EXPIRY,
+            "auto_renew": False,
+            "raw_data": {},
+        }
+
+    def _verify(self, client, auth, token):
+        return client.post(
+            "/api/v1/payments/verify-purchase",
+            headers={"Authorization": f"Bearer {auth['access_token']}"},
+            json={
+                "provider": "google_play",
+                "product_id": "healthscan_pro_lifetime",
+                "purchase_token": token,
+            },
+        )
+
+    def test_same_token_cannot_unlock_a_second_account(self, client, monkeypatch, mock_db):
+        owner = _login_user(client, monkeypatch, email="owner@example.com", sub="sub-owner")
+        thief = _login_user(client, monkeypatch, email="thief@example.com", sub="sub-thief")
+
+        with patch("app.services.payment_service.StoreVerifier.verify_purchase") as mock_verify:
+            mock_verify.return_value = self._verified("shared-token")
+
+            assert self._verify(client, owner, "shared-token").status_code == 200
+
+            resp = self._verify(client, thief, "shared-token")
+            assert resp.status_code == 409
+            assert resp.get_json()["error"] == "PurchaseAlreadyLinked"
+
+        thief_status = client.get(
+            "/api/v1/payments/status",
+            headers={"Authorization": f"Bearer {thief['access_token']}"},
+        ).get_json()
+        owner_status = client.get(
+            "/api/v1/payments/status",
+            headers={"Authorization": f"Bearer {owner['access_token']}"},
+        ).get_json()
+        assert thief_status["is_pro"] is False
+        assert owner_status["is_pro"] is True
+
+    def test_owner_can_reverify_same_token(self, client, monkeypatch, mock_db):
+        owner = _login_user(client, monkeypatch, email="again@example.com", sub="sub-again")
+        with patch("app.services.payment_service.StoreVerifier.verify_purchase") as mock_verify:
+            mock_verify.return_value = self._verified("my-token")
+            assert self._verify(client, owner, "my-token").status_code == 200
+            assert self._verify(client, owner, "my-token").status_code == 200
+
+
+class TestWebhookFailClosed:
+    def test_google_webhook_disabled_without_secret_outside_tests(self, client, app, monkeypatch):
+        monkeypatch.setattr("app.config.Config.GOOGLE_RTDN_WEBHOOK_SECRET", "")
+        monkeypatch.setitem(app.config, "TESTING", False)
+        resp = client.post("/api/v1/payments/webhook/google", json={"message": {"data": "e30="}})
+        assert resp.status_code == 503
+        assert resp.get_json()["error"] == "WebhookNotConfigured"
+
+    def test_apple_webhook_disabled_without_secret_outside_tests(self, client, app, monkeypatch):
+        monkeypatch.setattr("app.config.Config.APPLE_WEBHOOK_SECRET", "")
+        monkeypatch.setitem(app.config, "TESTING", False)
+        resp = client.post("/api/v1/payments/webhook/apple", json={"signedPayload": "x"})
+        assert resp.status_code == 503
+
+    def test_webhook_accepts_correct_secret(self, client, monkeypatch):
+        import base64, json as _json
+
+        monkeypatch.setattr("app.config.Config.GOOGLE_RTDN_WEBHOOK_SECRET", "s3cret")
+        data = base64.b64encode(_json.dumps({"testNotification": {}}).encode()).decode()
+        ok = client.post(
+            "/api/v1/payments/webhook/google?token=s3cret",
+            json={"message": {"data": data}},
+        )
+        assert ok.status_code == 200
+        header_ok = client.post(
+            "/api/v1/payments/webhook/google",
+            headers={"X-Webhook-Token": "s3cret"},
+            json={"message": {"data": data}},
+        )
+        assert header_ok.status_code == 200
+
+
+class TestAppleJwsVerification:
+    """Builds a throw-away Apple-style cert chain and checks decode_apple_jws end-to-end."""
+
+    @staticmethod
+    def _make_chain(marker_oids=True):
+        import datetime as dt
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+        from app.services import store_verifier as sv
+
+        def name(cn):
+            return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+        def build(subject_cn, subject_key, issuer_cn, issuer_key, marker=None, ca=False):
+            now = dt.datetime.now(dt.timezone.utc)
+            builder = (
+                x509.CertificateBuilder()
+                .subject_name(name(subject_cn))
+                .issuer_name(name(issuer_cn))
+                .public_key(subject_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - dt.timedelta(days=1))
+                .not_valid_after(now + dt.timedelta(days=30))
+            )
+            if marker is not None:
+                builder = builder.add_extension(x509.UnrecognizedExtension(marker, b"\x05\x00"), critical=False)
+            return builder.sign(issuer_key, hashes.SHA384())
+
+        root_key = ec.generate_private_key(ec.SECP384R1())
+        inter_key = ec.generate_private_key(ec.SECP384R1())
+        leaf_key = ec.generate_private_key(ec.SECP256R1())  # ES256 signing key
+
+        root = build("Test Apple Root", root_key, "Test Apple Root", root_key)
+        inter = build(
+            "Test WWDR", inter_key, "Test Apple Root", root_key,
+            marker=sv.APPLE_INTERMEDIATE_MARKER_OID if marker_oids else None,
+        )
+        leaf = build(
+            "Test Leaf", leaf_key, "Test WWDR", inter_key,
+            marker=sv.APPLE_LEAF_MARKER_OID if marker_oids else None,
+        )
+        return root, inter, leaf, leaf_key
+
+    @staticmethod
+    def _sign(payload, leaf_key, chain):
+        import base64
+        import jwt as pyjwt
+        from cryptography.hazmat.primitives.serialization import Encoding
+
+        x5c = [base64.b64encode(c.public_bytes(Encoding.DER)).decode() for c in chain]
+        return pyjwt.encode(payload, leaf_key, algorithm="ES256", headers={"x5c": x5c})
+
+    def test_valid_chain_is_accepted(self, monkeypatch):
+        from cryptography.hazmat.primitives import hashes
+        from app.services import store_verifier as sv
+
+        root, inter, leaf, leaf_key = self._make_chain()
+        monkeypatch.setattr(sv, "APPLE_ROOT_CA_G3_SHA256", root.fingerprint(hashes.SHA256()).hex())
+
+        token = self._sign({"transactionId": "t1", "productId": "p"}, leaf_key, [leaf, inter, root])
+        assert sv.decode_apple_jws(token)["transactionId"] == "t1"
+
+    def test_untrusted_root_is_rejected(self):
+        from app.services import store_verifier as sv
+
+        root, inter, leaf, leaf_key = self._make_chain()  # fingerprint NOT pinned
+        token = self._sign({"transactionId": "t1"}, leaf_key, [leaf, inter, root])
+        try:
+            sv.decode_apple_jws(token)
+            assert False, "expected InvalidReceiptError"
+        except InvalidReceiptError:
+            pass
+
+    def test_tampered_payload_is_rejected(self, monkeypatch):
+        import base64, json as _json
+        from cryptography.hazmat.primitives import hashes
+        from app.services import store_verifier as sv
+
+        root, inter, leaf, leaf_key = self._make_chain()
+        monkeypatch.setattr(sv, "APPLE_ROOT_CA_G3_SHA256", root.fingerprint(hashes.SHA256()).hex())
+        token = self._sign({"transactionId": "t1"}, leaf_key, [leaf, inter, root])
+
+        header, payload, signature = token.split(".")
+        forged = base64.urlsafe_b64encode(_json.dumps({"transactionId": "forged"}).encode()).rstrip(b"=").decode()
+        try:
+            sv.decode_apple_jws(f"{header}.{forged}.{signature}")
+            assert False, "expected InvalidReceiptError"
+        except InvalidReceiptError:
+            pass
+
+    def test_hs256_forgery_and_missing_chain_are_rejected(self):
+        import jwt as pyjwt
+        from app.services import store_verifier as sv
+
+        for forged in (
+            pyjwt.encode({"transactionId": "x"}, "k" * 32, algorithm="HS256"),
+            "not-a-jwt",
+            "",
+        ):
+            try:
+                sv.decode_apple_jws(forged)
+                assert False, "expected InvalidReceiptError"
+            except InvalidReceiptError:
+                pass
+
+    def test_missing_apple_marker_extensions_are_rejected(self, monkeypatch):
+        from cryptography.hazmat.primitives import hashes
+        from app.services import store_verifier as sv
+
+        root, inter, leaf, leaf_key = self._make_chain(marker_oids=False)
+        monkeypatch.setattr(sv, "APPLE_ROOT_CA_G3_SHA256", root.fingerprint(hashes.SHA256()).hex())
+        token = self._sign({"transactionId": "t1"}, leaf_key, [leaf, inter, root])
+        try:
+            sv.decode_apple_jws(token)
+            assert False, "expected InvalidReceiptError"
+        except InvalidReceiptError:
+            pass
+
+
+class TestSameUserMultipleApps:
+    def test_one_account_can_hold_independent_subscriptions_in_two_apps(self, client, monkeypatch, mock_db):
+        """Same Google account, two apps: each app has its own subscription row & entitlement."""
+        # Give the second app its own plan so it can be purchased
+        second_app = next(a for a in mock_db.apps.values() if a["app_key"] == "healthscan_app")
+        mock_db.subscription_plans["plan-second-yearly"] = {
+            "id": "plan-second-yearly",
+            "app_id": second_app["id"],
+            "plan_key": "yearly_pro",
+            "name": "Second App Pro Yearly",
+            "description": None,
+            "google_product_id": "second_pro_yearly",
+            "apple_product_id": None,
+            "price": 99,
+            "currency": "INR",
+            "billing_period": "yearly",
+            "trial_days": 0,
+            "features": {"premium": True},
+            "is_active": True,
+            "created_at": datetime.now(timezone.utc),
+        }
+
+        auth_a = _login_user(client, monkeypatch, email="both@example.com", sub="sub-both", app_key="main_app")
+        auth_b = _login_user(client, monkeypatch, email="both@example.com", sub="sub-both", app_key="healthscan_app")
+        assert auth_a["user"]["id"] == auth_b["user"]["id"]  # one global user
+        assert auth_a["app"]["app_key"] != auth_b["app"]["app_key"]
+
+        def buy(auth, product_id, token):
+            with patch("app.services.payment_service.StoreVerifier.verify_purchase") as mv:
+                mv.return_value = {
+                    "provider_subscription_id": token,
+                    "provider_transaction_id": f"GPA.{token}",
+                    "status": "active",
+                    "starts_at": datetime.now(timezone.utc),
+                    "expires_at": datetime.now(timezone.utc) + timedelta(days=365),
+                    "auto_renew": True,
+                    "raw_data": {},
+                }
+                return client.post(
+                    "/api/v1/payments/verify-purchase",
+                    headers={"Authorization": f"Bearer {auth['access_token']}"},
+                    json={"provider": "google_play", "product_id": product_id, "purchase_token": token},
+                )
+
+        def status(auth):
+            return client.get(
+                "/api/v1/payments/status",
+                headers={"Authorization": f"Bearer {auth['access_token']}"},
+            ).get_json()
+
+        # Buy only in app A -> B stays free
+        assert buy(auth_a, "healthscan_pro_yearly", "tok-app-a").status_code == 200
+        assert status(auth_a)["is_pro"] is True
+        assert status(auth_b)["is_pro"] is False
+
+        # Buy in app B with the SAME account -> both Pro, two separate rows
+        assert buy(auth_b, "second_pro_yearly", "tok-app-b").status_code == 200
+        assert status(auth_a)["is_pro"] is True
+        assert status(auth_b)["is_pro"] is True
+        assert status(auth_a)["plan_name"] != status(auth_b)["plan_name"]
+        assert status(auth_b)["plan_name"] == "Second App Pro Yearly"
+        assert len(mock_db.user_subscriptions) == 2
+
+        # Cancelling/expiring one app does not touch the other
+        key_a = next(k for k, v in mock_db.user_subscriptions.items() if v["provider_subscription_id"] == "tok-app-a")
+        mock_db.user_subscriptions[key_a]["expires_at"] = datetime.now(timezone.utc) - timedelta(days=1)
+        assert status(auth_a)["is_pro"] is False
+        assert status(auth_b)["is_pro"] is True

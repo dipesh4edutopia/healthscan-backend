@@ -42,6 +42,11 @@ class InvalidProviderError(PaymentServiceError):
     pass
 
 
+class PurchaseAlreadyLinkedError(PaymentServiceError):
+    """This store purchase is already linked to a different user account."""
+    pass
+
+
 def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
         return None
@@ -166,6 +171,22 @@ class PaymentService:
         raw_json = json.dumps(verified.get("raw_data") or {}, default=str)
 
         with get_db_cursor(commit=True) as cursor:
+            # 0. Ownership check: a store purchase token/original transaction may only ever
+            #    entitle ONE user. Prevents sharing a valid token across accounts.
+            existing_owner = PaymentService._find_subscription_by_provider_id(
+                provider, verified["provider_subscription_id"], cursor
+            )
+            if existing_owner and str(existing_owner["user_id"]) != str(user_id):
+                logger.warning(
+                    "Rejected purchase: token already linked to another user (provider=%s app=%s)",
+                    provider,
+                    app_key,
+                )
+                raise PurchaseAlreadyLinkedError(
+                    "This purchase is already linked to a different account. "
+                    "Please sign in with the Google account you originally purchased with."
+                )
+
             # 1. Upsert user_subscriptions (1 active/latest record per user + app)
             cursor.execute(
                 """
@@ -519,9 +540,9 @@ class PaymentService:
             raise PaymentServiceError("Missing signedPayload in Apple webhook.")
 
         try:
-            outer = jwt.decode(signed_payload, options={"verify_signature": False})
-        except Exception as exc:
-            raise PaymentServiceError(f"Invalid Apple signedPayload JWT: {exc}") from exc
+            outer = StoreVerifier.decode_apple_jws(signed_payload)
+        except InvalidReceiptError as exc:
+            raise PaymentServiceError(f"Invalid Apple signedPayload: {exc}") from exc
 
         notif_type = outer.get("notificationType", "")
         if notif_type == "TEST":
@@ -532,7 +553,10 @@ class PaymentService:
         if not signed_tx:
             return {"handled": False, "reason": "missing_signedTransactionInfo"}
 
-        tx_info = jwt.decode(signed_tx, options={"verify_signature": False})
+        try:
+            tx_info = StoreVerifier.decode_apple_jws(signed_tx)
+        except InvalidReceiptError as exc:
+            raise PaymentServiceError(f"Invalid Apple signedTransactionInfo: {exc}") from exc
         original_tx_id = str(tx_info.get("originalTransactionId") or "")
         tx_id = str(tx_info.get("transactionId") or "")
 
