@@ -104,6 +104,24 @@ class Config:
     GOOGLE_RTDN_WEBHOOK_SECRET = os.getenv('GOOGLE_RTDN_WEBHOOK_SECRET', '').strip()
     APPLE_WEBHOOK_SECRET = os.getenv('APPLE_WEBHOOK_SECRET', '').strip()
 
+    # ------------------------------------------------------------------
+    # Email & Password Auth / Transactional Email Settings
+    # ------------------------------------------------------------------
+    REQUIRE_EMAIL_VERIFICATION = os.getenv('REQUIRE_EMAIL_VERIFICATION', 'False').lower() in ('true', '1', 't')
+    MAX_FAILED_LOGIN_ATTEMPTS = int(os.getenv('MAX_FAILED_LOGIN_ATTEMPTS', 5))
+    ACCOUNT_LOCKOUT_MINUTES = int(os.getenv('ACCOUNT_LOCKOUT_MINUTES', 15))
+    PASSWORD_RESET_OTP_MINUTES = int(os.getenv('PASSWORD_RESET_OTP_MINUTES', 15))
+    PASSWORD_RESET_MAX_ATTEMPTS = int(os.getenv('PASSWORD_RESET_MAX_ATTEMPTS', 5))
+
+    # Email delivery: 'resend' | 'smtp' | 'console' (auto-detected if blank)
+    EMAIL_PROVIDER = os.getenv('EMAIL_PROVIDER', '').strip()
+    EMAIL_FROM = os.getenv('EMAIL_FROM', 'Auth <onboarding@resend.dev>').strip()
+    RESEND_API_KEY = os.getenv('RESEND_API_KEY', '').strip()
+    SMTP_HOST = os.getenv('SMTP_HOST', '').strip()
+    SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
+    SMTP_USER = os.getenv('SMTP_USER', '').strip()
+    SMTP_PASS = os.getenv('SMTP_PASS', '').strip()
+
 
 class TestConfig(Config):
     """Testing Configuration"""

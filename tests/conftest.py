@@ -82,24 +82,55 @@ class MockCursor:
             return
 
         # -------------------------------------------------------------
+        # 4b. SELECT FROM public.users WHERE id = %s
+        # -------------------------------------------------------------
+        if "FROM public.users" in normalized and "WHERE id = %s" in normalized:
+            uid = str(params[0])
+            u = self.db.users.get(uid)
+            self.last_result = [dict(u)] if u else []
+            return
+
+        # -------------------------------------------------------------
         # 5. INSERT INTO public.users
         # -------------------------------------------------------------
         if "INSERT INTO public.users" in normalized:
-            # (google_sub, email, email_verified, full_name, avatar_url)
-            google_sub, email, email_verified, full_name, avatar_url = params
             user_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
-            user_record = {
-                'id': user_id,
-                'google_sub': google_sub,
-                'email': email.lower(),
-                'email_verified': email_verified,
-                'full_name': full_name,
-                'avatar_url': avatar_url,
-                'is_active': True,
-                'created_at': now,
-                'updated_at': now,
-            }
+            if "password_hash" in normalized:
+                email, full_name, pw_hash = params
+                user_record = {
+                    'id': user_id,
+                    'google_sub': None,
+                    'email': email.lower(),
+                    'email_verified': False,
+                    'full_name': full_name,
+                    'avatar_url': None,
+                    'password_hash': pw_hash,
+                    'password_updated_at': now,
+                    'failed_login_attempts': 0,
+                    'locked_until': None,
+                    'is_active': True,
+                    'created_at': now,
+                    'updated_at': now,
+                }
+            else:
+                # (google_sub, email, email_verified, full_name, avatar_url)
+                google_sub, email, email_verified, full_name, avatar_url = params
+                user_record = {
+                    'id': user_id,
+                    'google_sub': google_sub,
+                    'email': email.lower(),
+                    'email_verified': email_verified,
+                    'full_name': full_name,
+                    'avatar_url': avatar_url,
+                    'password_hash': None,
+                    'password_updated_at': None,
+                    'failed_login_attempts': 0,
+                    'locked_until': None,
+                    'is_active': True,
+                    'created_at': now,
+                    'updated_at': now,
+                }
             self.db.users[user_id] = user_record
             self.last_result = [dict(user_record)]
             return
@@ -108,7 +139,6 @@ class MockCursor:
         # 6. UPDATE public.users
         # -------------------------------------------------------------
         if "UPDATE public.users" in normalized:
-            # Check which update query it is
             now = datetime.now(timezone.utc)
             if "SET email = %s" in normalized:
                 email, email_verified, full_name, avatar_url, uid = params
@@ -135,10 +165,97 @@ class MockCursor:
                         u['full_name'] = full_name
                     if avatar_url:
                         u['avatar_url'] = avatar_url
+                    if "password_hash = NULL" in normalized:
+                        u['password_hash'] = None
+                        u['failed_login_attempts'] = 0
+                        u['locked_until'] = None
+                    u['updated_at'] = now
+                    self.last_result = [dict(u)]
+                    return
+            elif "SET password_hash = %s" in normalized:
+                pw_hash, uid = params
+                uid_str = str(uid)
+                if uid_str in self.db.users:
+                    u = self.db.users[uid_str]
+                    u['password_hash'] = pw_hash
+                    u['password_updated_at'] = now
+                    if "email_verified = TRUE" in normalized:
+                        u['email_verified'] = True
+                    u['failed_login_attempts'] = 0
+                    u['locked_until'] = None
+                    u['updated_at'] = now
+                    self.last_result = [dict(u)]
+                    return
+            elif "SET failed_login_attempts = %s" in normalized:
+                attempts, locked_until, uid = params
+                uid_str = str(uid)
+                if uid_str in self.db.users:
+                    u = self.db.users[uid_str]
+                    u['failed_login_attempts'] = attempts
+                    u['locked_until'] = locked_until
+                    u['updated_at'] = now
+                    self.last_result = [dict(u)]
+                    return
+            elif "SET failed_login_attempts = 0" in normalized:
+                uid_str = str(params[0])
+                if uid_str in self.db.users:
+                    u = self.db.users[uid_str]
+                    u['failed_login_attempts'] = 0
+                    u['locked_until'] = None
                     u['updated_at'] = now
                     self.last_result = [dict(u)]
                     return
 
+            self.last_result = []
+            return
+
+        # -------------------------------------------------------------
+        # 6b. public.auth_verification_tokens (OTP reset / verify)
+        # -------------------------------------------------------------
+        if "INSERT INTO public.auth_verification_tokens" in normalized:
+            uid, token_hash, expires_at = params
+            tid = str(uuid.uuid4())
+            rec = {
+                'id': tid,
+                'user_id': str(uid),
+                'purpose': 'password_reset',
+                'token_hash': token_hash,
+                'attempts': 0,
+                'expires_at': expires_at,
+                'used_at': None,
+                'created_at': datetime.now(timezone.utc),
+            }
+            self.db.auth_tokens.append(rec)
+            self.last_result = [{'id': tid}]
+            return
+
+        if "FROM public.auth_verification_tokens" in normalized:
+            uid = str(params[0])
+            matches = [
+                dict(t) for t in self.db.auth_tokens
+                if t['user_id'] == uid and t['purpose'] == 'password_reset' and t['used_at'] is None
+            ]
+            matches.sort(key=lambda t: t['created_at'], reverse=True)
+            self.last_result = matches[:1]
+            return
+
+        if "UPDATE public.auth_verification_tokens" in normalized:
+            now = datetime.now(timezone.utc)
+            if "WHERE user_id = %s" in normalized:
+                uid = str(params[0])
+                for t in self.db.auth_tokens:
+                    if t['user_id'] == uid and t['purpose'] == 'password_reset' and t['used_at'] is None:
+                        t['used_at'] = now
+            elif "SET attempts = attempts + 1" in normalized:
+                tid = str(params[0])
+                for t in self.db.auth_tokens:
+                    if t['id'] == tid:
+                        t['attempts'] += 1
+            elif "SET used_at = NOW()" in normalized and "WHERE id = %s" in normalized:
+                tid = str(params[0])
+                for t in self.db.auth_tokens:
+                    if t['id'] == tid:
+                        t['used_at'] = now
             self.last_result = []
             return
 
@@ -275,6 +392,8 @@ class MockCursor:
             if u and a:
                 self.last_result = [{
                     'id': u['id'],
+                    'google_sub': u.get('google_sub'),
+                    'password_hash': u.get('password_hash'),
                     'email': u['email'],
                     'email_verified': u['email_verified'],
                     'full_name': u['full_name'],
@@ -485,6 +604,7 @@ class MockDatabase:
         self.subscription_plans: Dict[str, Dict[str, Any]] = {}
         self.user_subscriptions: Dict[tuple, Dict[str, Any]] = {}
         self.payment_transactions: Dict[tuple, Dict[str, Any]] = {}
+        self.auth_tokens: List[Dict[str, Any]] = []
 
         # Pre-seed applications & plans
         self._seed_default_apps()

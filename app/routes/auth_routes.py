@@ -15,7 +15,14 @@ from app.services.auth_service import (
     InvalidSessionError,
     SessionRevokedError,
     SessionExpiredError,
+    EmailAlreadyRegisteredError,
+    InvalidCredentialsError,
+    PasswordNotSetError,
+    AccountLockedError,
+    InvalidResetCodeError,
 )
+from app.services.password_service import InvalidEmailError, WeakPasswordError
+from app.services.email_service import EmailDeliveryError
 from app.services.google_auth import (
     GoogleAuthError,
     InvalidTokenError,
@@ -105,6 +112,164 @@ def google_sign_in():
         return jsonify({
             'error': 'InternalServerError',
             'message': 'An unexpected authentication error occurred on the server.',
+        }), 500
+
+
+@auth_bp.route('/register', methods=['POST'])
+def register_with_email():
+    """Register a new account with Email + Password."""
+    data = request.get_json(silent=True) or {}
+    email = data.get('email')
+    password = data.get('password')
+    full_name = data.get('full_name')
+    app_key = data.get('app_key') or request.headers.get('X-App-Key')
+    device_label = data.get('device_label')
+    user_agent = request.headers.get('User-Agent')
+
+    try:
+        result = AuthService.register_with_email(
+            email=email,
+            password=password,
+            full_name=full_name,
+            app_key=app_key,
+            user_agent=user_agent,
+            device_label=device_label,
+        )
+        return jsonify(result), 201
+    except InvalidEmailError as iee:
+        return jsonify({'error': 'InvalidEmail', 'message': str(iee)}), 400
+    except WeakPasswordError as wpe:
+        return jsonify({'error': 'WeakPassword', 'message': str(wpe)}), 400
+    except EmailAlreadyRegisteredError as eare:
+        return jsonify({'error': 'EmailAlreadyRegistered', 'message': str(eare)}), 409
+    except AppNotFoundError as ane:
+        return jsonify({'error': 'AppNotFound', 'message': str(ane)}), 404
+    except AppInactiveError as aie:
+        return jsonify({'error': 'AppInactive', 'message': str(aie)}), 403
+    except AppAccessDeniedError as aade:
+        return jsonify({'error': 'AppAccessDenied', 'message': str(aade)}), 403
+    except Exception:
+        logger.exception("Unexpected error during email registration")
+        return jsonify({
+            'error': 'InternalServerError',
+            'message': 'An unexpected error occurred during registration.',
+        }), 500
+
+
+@auth_bp.route('/login', methods=['POST'])
+def login_with_email():
+    """Authenticate an existing user with Email + Password."""
+    data = request.get_json(silent=True) or {}
+    email = data.get('email')
+    password = data.get('password')
+    app_key = data.get('app_key') or request.headers.get('X-App-Key')
+    device_label = data.get('device_label')
+    user_agent = request.headers.get('User-Agent')
+
+    try:
+        result = AuthService.login_with_email(
+            email=email,
+            password=password,
+            app_key=app_key,
+            user_agent=user_agent,
+            device_label=device_label,
+        )
+        return jsonify(result), 200
+    except InvalidEmailError as iee:
+        return jsonify({'error': 'InvalidEmail', 'message': str(iee)}), 400
+    except PasswordNotSetError as pnse:
+        return jsonify({'error': 'PasswordNotSet', 'message': str(pnse)}), 400
+    except InvalidCredentialsError as ice:
+        return jsonify({'error': 'InvalidCredentials', 'message': str(ice)}), 401
+    except AccountLockedError as ale:
+        return jsonify({'error': 'AccountLocked', 'message': str(ale)}), 429
+    except AppNotFoundError as ane:
+        return jsonify({'error': 'AppNotFound', 'message': str(ane)}), 404
+    except (AppInactiveError, UserDeactivatedError, AppAccessDeniedError) as ae:
+        return jsonify({'error': ae.__class__.__name__.replace('Error', ''), 'message': str(ae)}), 403
+    except Exception:
+        logger.exception("Unexpected error during email login")
+        return jsonify({
+            'error': 'InternalServerError',
+            'message': 'An unexpected error occurred during login.',
+        }), 500
+
+
+@auth_bp.route('/forgot-password', methods=['POST'])
+def forgot_password():
+    """Send a 6-digit password reset code to the user's email."""
+    data = request.get_json(silent=True) or {}
+    email = data.get('email')
+    app_key = data.get('app_key') or request.headers.get('X-App-Key')
+
+    try:
+        result = AuthService.request_password_reset(email=email, app_key=app_key)
+        return jsonify(result), 200
+    except InvalidEmailError as iee:
+        return jsonify({'error': 'InvalidEmail', 'message': str(iee)}), 400
+    except EmailDeliveryError as ede:
+        return jsonify({'error': 'EmailDeliveryFailed', 'message': str(ede)}), 502
+    except Exception:
+        logger.exception("Unexpected error during forgot-password")
+        return jsonify({
+            'error': 'InternalServerError',
+            'message': 'Could not process password reset request.',
+        }), 500
+
+
+@auth_bp.route('/reset-password', methods=['POST'])
+def reset_password():
+    """Verify 6-digit OTP and set a new password."""
+    data = request.get_json(silent=True) or {}
+    email = data.get('email')
+    otp = data.get('otp')
+    new_password = data.get('new_password')
+
+    try:
+        result = AuthService.reset_password(email=email, otp=otp, new_password=new_password)
+        return jsonify(result), 200
+    except InvalidEmailError as iee:
+        return jsonify({'error': 'InvalidEmail', 'message': str(iee)}), 400
+    except WeakPasswordError as wpe:
+        return jsonify({'error': 'WeakPassword', 'message': str(wpe)}), 400
+    except InvalidResetCodeError as irce:
+        return jsonify({'error': 'InvalidResetCode', 'message': str(irce)}), 400
+    except UserDeactivatedError as ude:
+        return jsonify({'error': 'UserDeactivated', 'message': str(ude)}), 403
+    except Exception:
+        logger.exception("Unexpected error during reset-password")
+        return jsonify({
+            'error': 'InternalServerError',
+            'message': 'Could not reset password.',
+        }), 500
+
+
+@auth_bp.route('/change-password', methods=['POST'])
+@require_auth
+def change_password():
+    """Change password (or add a password to a Google-only account) for the signed-in user."""
+    data = request.get_json(silent=True) or {}
+    current_password = data.get('current_password')
+    new_password = data.get('new_password')
+
+    try:
+        result = AuthService.change_password(
+            user_id=g.current_user_id,
+            new_password=new_password,
+            current_password=current_password,
+        )
+        return jsonify(result), 200
+    except WeakPasswordError as wpe:
+        return jsonify({'error': 'WeakPassword', 'message': str(wpe)}), 400
+    except InvalidCredentialsError as ice:
+        return jsonify({'error': 'InvalidCredentials', 'message': str(ice)}), 401
+    except UserDeactivatedError as ude:
+        return jsonify({'error': 'UserDeactivated', 'message': str(ude)}), 403
+    except Exception:
+        logger.exception("Unexpected error during change-password")
+        return jsonify({
+            'error': 'InternalServerError',
+            'message': 'Could not update password.',
         }), 500
 
 
@@ -244,6 +409,8 @@ def get_current_user_profile():
                 'email_verified': profile['email_verified'],
                 'full_name': profile['full_name'],
                 'avatar_url': profile['avatar_url'],
+                'has_google': bool(profile.get('google_sub')),
+                'has_password': bool(profile.get('password_hash')),
                 'is_active': profile['is_active'],
                 'created_at': profile['created_at'].isoformat() if profile.get('created_at') else None,
             },
